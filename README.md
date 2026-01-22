@@ -47,12 +47,18 @@ Parameters are persisted to `/var/lib/cpu-throttle/state.json`.
 
 ### 3. Frequency Control Strategy
 
+The daemon automatically reads the CPU's maximum frequency from the system
+(`cpuinfo_max_freq`) and calculates throttling thresholds dynamically:
+
 | Effective Temperature | Frequency Behavior |
 |-----------------------|-------------------|
-| < 70°C | Full speed (3.9 GHz) |
-| 70-85°C | Linear throttle (3.9 GHz → 2.8 GHz) |
-| 85-95°C | Aggressive throttle (2.8 GHz → 2.4 GHz) |
-| ≥ 95°C | Emergency mode (2.0 GHz) |
+| < 70°C | 100% of CPU max frequency |
+| 70-85°C | 100% → 72% (linear throttle) |
+| 85-95°C | 72% → 60% (aggressive throttle) |
+| ≥ 95°C | 60% (minimum frequency) |
+
+Frequency ratios are configurable via `MIN_FREQ_RATIO` (default: 0.60) and
+`MID_FREQ_RATIO` (default: 0.72) in the source code.
 
 ## Installation
 
@@ -167,10 +173,12 @@ The daemon uses compile-time constants defined in `src/main.rs`:
 | `TEMP_FULL_SPEED` | `70` | Max frequency temperature threshold (°C) |
 | `TEMP_STEEP_START` | `85` | Aggressive throttle start (°C) |
 | `TEMP_EMERGENCY` | `95` | Emergency mode threshold (°C) |
-| `FREQ_MAX_KHZ` | `3_900_000` | Maximum CPU frequency (Hz) |
-| `FREQ_MIN_KHZ` | `2_400_000` | Minimum normal frequency (Hz) |
-| `FREQ_EMERGENCY_KHZ` | `2_000_000` | Emergency frequency (Hz) |
+| `MIN_FREQ_RATIO` | `0.60` | Minimum frequency as ratio of CPU max |
+| `MID_FREQ_RATIO` | `0.72` | Mid frequency as ratio of CPU max |
 | `GRANULARITY_KHZ` | `100_000` | Frequency adjustment step (Hz) |
+
+**Note:** CPU maximum frequency is read automatically from
+`/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq`.
 
 **Note**: You may need to adjust `THERMAL_ZONE` depending on your hardware. Check available zones with:
 ```bash
