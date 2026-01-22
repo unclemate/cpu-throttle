@@ -10,20 +10,81 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::signal;
 use tokio::time;
 
-const THERMAL_ZONE: &str = "/sys/class/thermal/thermal_zone6/temp";
 const CPU_FREQ_DIR: &str = "/sys/devices/system/cpu";
 const STATE_FILE: &str = "/var/lib/cpu-throttle/state.json";
 const LOG_FILE: &str = "/var/log/cpu-throttle.log";
+const CONFIG_FILE: &str = "/etc/cpu-throttle/config.toml";
 
-// Configuration
-const PREDICT_AHEAD_SEC: f64 = 2.0;
-const TEMP_FULL_SPEED: i32 = 70;
-const TEMP_STEEP_START: i32 = 85;
-const TEMP_EMERGENCY: i32 = 95;
+/// Configuration loaded from file or defaults
+#[derive(serde::Deserialize, Debug, Clone)]
+struct Config {
+    #[serde(default = "default_thermal_zone")]
+    thermal_zone: String,
 
-const GRANULARITY_KHZ: u64 = 100_000;
-const MIN_FREQ_RATIO: f64 = 0.60;  // Minimum frequency is 60% of max
-const MID_FREQ_RATIO: f64 = 0.72;  // Mid frequency is ~72% of max
+    #[serde(default = "default_predict_ahead")]
+    predict_ahead_sec: f64,
+
+    #[serde(default = "default_temp_full_speed")]
+    temp_full_speed: i32,
+
+    #[serde(default = "default_temp_steep_start")]
+    temp_steep_start: i32,
+
+    #[serde(default = "default_temp_emergency")]
+    temp_emergency: i32,
+
+    #[serde(default = "default_granularity")]
+    granularity_khz: u64,
+
+    #[serde(default = "default_min_freq_ratio")]
+    min_freq_ratio: f64,
+
+    #[serde(default = "default_mid_freq_ratio")]
+    mid_freq_ratio: f64,
+}
+
+// Default functions for serde
+fn default_thermal_zone() -> String { "thermal_zone6".to_string() }
+fn default_predict_ahead() -> f64 { 2.0 }
+fn default_temp_full_speed() -> i32 { 70 }
+fn default_temp_steep_start() -> i32 { 85 }
+fn default_temp_emergency() -> i32 { 95 }
+fn default_granularity() -> u64 { 100_000 }
+fn default_min_freq_ratio() -> f64 { 0.60 }
+fn default_mid_freq_ratio() -> f64 { 0.72 }
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            thermal_zone: default_thermal_zone(),
+            predict_ahead_sec: default_predict_ahead(),
+            temp_full_speed: default_temp_full_speed(),
+            temp_steep_start: default_temp_steep_start(),
+            temp_emergency: default_temp_emergency(),
+            granularity_khz: default_granularity(),
+            min_freq_ratio: default_min_freq_ratio(),
+            mid_freq_ratio: default_mid_freq_ratio(),
+        }
+    }
+}
+
+/// Load configuration from file, falling back to defaults
+fn load_config() -> Config {
+    if let Ok(content) = fs::read_to_string(CONFIG_FILE) {
+        match toml::from_str(&content) {
+            Ok(config) => {
+                info!("Loaded configuration from {}", CONFIG_FILE);
+                return config;
+            }
+            Err(e) => {
+                warn!("Failed to parse config file: {}, using defaults", e);
+            }
+        }
+    } else {
+        info!("No config file found at {}, using defaults", CONFIG_FILE);
+    }
+    Config::default()
+}
 
 /// Dynamic frequency limits derived from system CPU info
 #[derive(Debug, Clone)]
@@ -50,9 +111,10 @@ impl Default for State {
     }
 }
 
-async fn read_cpu_temp() -> Result<i32> {
-    let content = fs::read_to_string(THERMAL_ZONE)
-        .with_context(|| format!("Failed to read {}", THERMAL_ZONE))?;
+async fn read_cpu_temp(thermal_zone: &str) -> Result<i32> {
+    let zone_path = format!("/sys/class/thermal/{}/temp", thermal_zone);
+    let content = fs::read_to_string(&zone_path)
+        .with_context(|| format!("Failed to read {}", zone_path))?;
     let temp_millicelsius: i32 = content.trim().parse()?;
     Ok(temp_millicelsius / 1000)
 }
@@ -83,11 +145,11 @@ fn read_cpu_max_freq() -> Result<u64> {
     Ok(max_khz)
 }
 
-/// Create frequency limits based on system CPU max frequency
-fn create_freq_limits() -> Result<FreqLimits> {
+/// Create frequency limits based on system CPU max frequency and config
+fn create_freq_limits(config: &Config) -> Result<FreqLimits> {
     let max_khz = read_cpu_max_freq()?;
-    let min_khz = (max_khz as f64 * MIN_FREQ_RATIO).round() as u64;
-    let mid_khz = (max_khz as f64 * MID_FREQ_RATIO).round() as u64;
+    let min_khz = (max_khz as f64 * config.min_freq_ratio).round() as u64;
+    let mid_khz = (max_khz as f64 * config.mid_freq_ratio).round() as u64;
 
     info!("CPU frequency limits: max={} MHz, mid={} MHz, min={} MHz",
           max_khz / 1000, mid_khz / 1000, min_khz / 1000);
@@ -110,20 +172,20 @@ fn set_cpu_freq(freq_khz: u64) -> Result<()> {
     Ok(())
 }
 
-fn calculate_target_freq(effective_temp: i32, limits: &FreqLimits) -> u64 {
-    if effective_temp >= TEMP_EMERGENCY {
+fn calculate_target_freq(effective_temp: i32, limits: &FreqLimits, config: &Config) -> u64 {
+    if effective_temp >= config.temp_emergency {
         limits.min_khz
-    } else if effective_temp >= TEMP_STEEP_START {
-        // Steep throttling: mid → min (85°C → 95°C)
-        let range = (TEMP_EMERGENCY - TEMP_STEEP_START) as u64;
-        let offset = (effective_temp - TEMP_STEEP_START) as u64;
+    } else if effective_temp >= config.temp_steep_start {
+        // Steep throttling: mid → min
+        let range = (config.temp_emergency - config.temp_steep_start) as u64;
+        let offset = (effective_temp - config.temp_steep_start) as u64;
         let step = (limits.mid_khz - limits.min_khz) / range;
         let khz = limits.mid_khz - offset * step;
         khz.max(limits.min_khz)
-    } else if effective_temp > TEMP_FULL_SPEED {
-        // Linear throttling: max → mid (70°C → 85°C)
-        let range = (TEMP_STEEP_START - TEMP_FULL_SPEED) as u64;
-        let offset = (effective_temp - TEMP_FULL_SPEED) as u64;
+    } else if effective_temp > config.temp_full_speed {
+        // Linear throttling: max → mid
+        let range = (config.temp_steep_start - config.temp_full_speed) as u64;
+        let offset = (effective_temp - config.temp_full_speed) as u64;
         let step = (limits.max_khz - limits.mid_khz) / range;
         let khz = limits.max_khz - offset * step;
         khz.max(limits.mid_khz)
@@ -132,8 +194,8 @@ fn calculate_target_freq(effective_temp: i32, limits: &FreqLimits) -> u64 {
     }
 }
 
-fn quantize_freq(freq: u64, limits: &FreqLimits) -> u64 {
-    let rounded = ((freq + GRANULARITY_KHZ / 2) / GRANULARITY_KHZ) * GRANULARITY_KHZ;
+fn quantize_freq(freq: u64, limits: &FreqLimits, config: &Config) -> u64 {
+    let rounded = ((freq + config.granularity_khz / 2) / config.granularity_khz) * config.granularity_khz;
     rounded.max(limits.min_khz)
 }
 
@@ -157,6 +219,11 @@ async fn load_state() -> Result<State> {
 async fn main() -> Result<()> {
     env_logger::init();
 
+    // Load configuration from file or use defaults
+    let config = load_config();
+    info!("Using configuration: thermal_zone={}, predict_ahead_sec={}s, temp_full_speed={}°C",
+          config.thermal_zone, config.predict_ahead_sec, config.temp_full_speed);
+
     // Open log file with buffered writer for better performance
     let log_file = OpenOptions::new()
         .create(true)
@@ -170,8 +237,8 @@ async fn main() -> Result<()> {
         State::default()
     });
 
-    // Initialize frequency limits from system CPU info
-    let freq_limits = create_freq_limits()?;
+    // Initialize frequency limits from system CPU info and config
+    let freq_limits = create_freq_limits(&config)?;
 
     let mut history: Vec<(u64, i32, u32, f64)> = Vec::new(); // (timestamp, temp, load, predicted_future_temp)
 
@@ -220,7 +287,7 @@ async fn main() -> Result<()> {
             .unwrap()
             .as_secs();
 
-        let temp_c = read_cpu_temp().await?;
+        let temp_c = read_cpu_temp(&config.thermal_zone).await?;
         let cpu_load = read_cpu_load()?;
 
         // Calculate temperature slope
@@ -236,8 +303,8 @@ async fn main() -> Result<()> {
             0.0
         };
 
-        // Predictive control
-        let predicted_rise = (temp_slope * PREDICT_AHEAD_SEC * state.k_slope).clamp(-3.0, 8.0);
+        // Predictive control using config values
+        let predicted_rise = (temp_slope * config.predict_ahead_sec * state.k_slope).clamp(-3.0, 8.0);
         let load_bias = (cpu_load as f64 * state.k_load).clamp(0.0, 4.0);
         let effective_temp = (temp_c as f64 + predicted_rise + load_bias).round() as i32;
 
@@ -266,8 +333,8 @@ async fn main() -> Result<()> {
         }
 
         // Frequency control
-        let target_khz = calculate_target_freq(effective_temp, &freq_limits);
-        let rounded_khz = quantize_freq(target_khz, &freq_limits);
+        let target_khz = calculate_target_freq(effective_temp, &freq_limits, &config);
+        let rounded_khz = quantize_freq(target_khz, &freq_limits, &config);
         let current_khz = read_current_freq().unwrap_or(rounded_khz);
 
         if rounded_khz != current_khz {
