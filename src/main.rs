@@ -195,10 +195,11 @@ async fn main() -> Result<()> {
         let load_bias = (cpu_load as f64 * state.k_load).clamp(0.0, 4.0);
         let effective_temp = (temp_c as f64 + predicted_rise + load_bias).round() as i32;
 
-        // Check prediction accuracy
+        // Check prediction accuracy (use closest match within 1-3 seconds ago)
         let mut pred_err: Option<f64> = None;
-        let target_ts = now - 2;
-        if let Some((_, _, _, past_pred)) = history.iter().find(|(ts, _, _, _)| *ts == target_ts) {
+        if let Some((_, _, _, past_pred)) = history.iter()
+            .filter(|(ts, _, _, _)| *ts >= now - 3 && *ts <= now - 1)
+            .min_by_key(|(ts, _, _, _)| ts.abs_diff(now - 2)) {
             let err = past_pred - temp_c as f64;
             pred_err = Some(err);
 
