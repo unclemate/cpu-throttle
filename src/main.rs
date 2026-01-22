@@ -2,7 +2,10 @@ use anyhow::{Context, Result};
 use log::{error, info, warn};
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::signal;
 use tokio::time;
 
 const THERMAL_ZONE: &str = "/sys/class/thermal/thermal_zone6/temp";
@@ -168,7 +171,46 @@ async fn main() -> Result<()> {
 
     let mut history: Vec<(u64, i32, u32, f64)> = Vec::new(); // (timestamp, temp, load, predicted_future_temp)
 
+    // Set up graceful shutdown handler
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = shutdown.clone();
+
+    // Spawn signal handler task
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+                .expect("Failed to setup SIGTERM handler");
+            let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())
+                .expect("Failed to setup SIGINT handler");
+            tokio::select! {
+                _ = signal::ctrl_c() => {
+                    info!("Received Ctrl-C, initiating graceful shutdown...");
+                }
+                _ = sigterm.recv() => {
+                    info!("Received SIGTERM, initiating graceful shutdown...");
+                }
+                _ = sigint.recv() => {
+                    info!("Received SIGINT, initiating graceful shutdown...");
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = signal::ctrl_c().await;
+            info!("Received Ctrl-C, initiating graceful shutdown...");
+        }
+        shutdown_clone.store(true, Ordering::SeqCst);
+    });
+
+    // Main control loop
     loop {
+        // Check for shutdown signal
+        if shutdown.load(Ordering::SeqCst) {
+            info!("Shutdown signal received, stopping control loop...");
+            break;
+        }
+
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -263,7 +305,23 @@ async fn main() -> Result<()> {
 
         info!("{}", log_msg);
 
-        // Sleep for 1 second
-        time::sleep(Duration::from_secs(1)).await;
+        // Sleep for 1 second, but check shutdown every 100ms
+        for _ in 0..10 {
+            if shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+            time::sleep(Duration::from_millis(100)).await;
+        }
     }
+
+    // Save state before shutdown
+    info!("Saving state before shutdown...");
+    if let Err(e) = save_state(&state).await {
+        error!("Failed to save state on shutdown: {}", e);
+    } else {
+        info!("State saved successfully");
+    }
+
+    info!("Shutdown complete");
+    Ok(())
 }
