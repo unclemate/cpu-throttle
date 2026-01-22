@@ -287,7 +287,7 @@ cargo build
 
 ## License
 
-This project is provided as-is for educational and practical use.
+This project is licensed under the GNU General Public License v3.0 or later. See [LICENSE](LICENSE) for details.
 
 ## Contributing
 

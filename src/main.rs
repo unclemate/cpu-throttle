@@ -16,11 +16,17 @@ const TEMP_FULL_SPEED: i32 = 70;
 const TEMP_STEEP_START: i32 = 85;
 const TEMP_EMERGENCY: i32 = 95;
 
-const FREQ_MAX_KHZ: u64 = 3_900_000;
-const FREQ_MID_KHZ: u64 = 2_800_000;
-const FREQ_MIN_KHZ: u64 = 2_400_000;
-const FREQ_EMERGENCY_KHZ: u64 = 2_000_000;
 const GRANULARITY_KHZ: u64 = 100_000;
+const MIN_FREQ_RATIO: f64 = 0.60;  // Minimum frequency is 60% of max
+const MID_FREQ_RATIO: f64 = 0.72;  // Mid frequency is ~72% of max
+
+/// Dynamic frequency limits derived from system CPU info
+#[derive(Debug, Clone)]
+struct FreqLimits {
+    max_khz: u64,
+    mid_khz: u64,
+    min_khz: u64,
+}
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct State {
@@ -62,6 +68,28 @@ fn read_current_freq() -> Result<u64> {
     Ok(content.trim().parse()?)
 }
 
+/// Read CPU's hardware maximum frequency from cpuinfo_max_freq
+fn read_cpu_max_freq() -> Result<u64> {
+    let path = Path::new(CPU_FREQ_DIR).join("cpu0/cpufreq/cpuinfo_max_freq");
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read cpuinfo_max_freq from {:?}", path))?;
+    let max_khz: u64 = content.trim().parse()
+        .with_context(|| format!("Failed to parse cpuinfo_max_freq: {}", content))?;
+    Ok(max_khz)
+}
+
+/// Create frequency limits based on system CPU max frequency
+fn create_freq_limits() -> Result<FreqLimits> {
+    let max_khz = read_cpu_max_freq()?;
+    let min_khz = (max_khz as f64 * MIN_FREQ_RATIO).round() as u64;
+    let mid_khz = (max_khz as f64 * MID_FREQ_RATIO).round() as u64;
+
+    info!("CPU frequency limits: max={} MHz, mid={} MHz, min={} MHz",
+          max_khz / 1000, mid_khz / 1000, min_khz / 1000);
+
+    Ok(FreqLimits { max_khz, mid_khz, min_khz })
+}
+
 fn set_cpu_freq(freq_khz: u64) -> Result<()> {
     let cpu_dirs: Vec<_> = fs::read_dir(CPU_FREQ_DIR)?
         .filter_map(|entry| entry.ok())
@@ -77,23 +105,31 @@ fn set_cpu_freq(freq_khz: u64) -> Result<()> {
     Ok(())
 }
 
-fn calculate_target_freq(effective_temp: i32) -> u64 {
+fn calculate_target_freq(effective_temp: i32, limits: &FreqLimits) -> u64 {
     if effective_temp >= TEMP_EMERGENCY {
-        FREQ_EMERGENCY_KHZ
+        limits.min_khz
     } else if effective_temp >= TEMP_STEEP_START {
-        let khz = FREQ_MID_KHZ - ((effective_temp - TEMP_STEEP_START) as u64) * 40_000;
-        khz.max(FREQ_MIN_KHZ)
+        // Steep throttling: mid → min (85°C → 95°C)
+        let range = (TEMP_EMERGENCY - TEMP_STEEP_START) as u64;
+        let offset = (effective_temp - TEMP_STEEP_START) as u64;
+        let step = (limits.mid_khz - limits.min_khz) / range;
+        let khz = limits.mid_khz - offset * step;
+        khz.max(limits.min_khz)
     } else if effective_temp > TEMP_FULL_SPEED {
-        let khz = FREQ_MAX_KHZ - ((effective_temp - TEMP_FULL_SPEED) as u64) * 73_333;
-        khz.max(FREQ_MID_KHZ)
+        // Linear throttling: max → mid (70°C → 85°C)
+        let range = (TEMP_STEEP_START - TEMP_FULL_SPEED) as u64;
+        let offset = (effective_temp - TEMP_FULL_SPEED) as u64;
+        let step = (limits.max_khz - limits.mid_khz) / range;
+        let khz = limits.max_khz - offset * step;
+        khz.max(limits.mid_khz)
     } else {
-        FREQ_MAX_KHZ
+        limits.max_khz
     }
 }
 
-fn quantize_freq(freq: u64) -> u64 {
+fn quantize_freq(freq: u64, limits: &FreqLimits) -> u64 {
     let rounded = ((freq + GRANULARITY_KHZ / 2) / GRANULARITY_KHZ) * GRANULARITY_KHZ;
-    rounded.max(FREQ_EMERGENCY_KHZ)
+    rounded.max(limits.min_khz)
 }
 
 async fn save_state(state: &State) -> Result<()> {
@@ -126,6 +162,9 @@ async fn main() -> Result<()> {
         warn!("Failed to load state: {}, using defaults", e);
         State::default()
     });
+
+    // Initialize frequency limits from system CPU info
+    let freq_limits = create_freq_limits()?;
 
     let mut history: Vec<(u64, i32, u32, f64)> = Vec::new(); // (timestamp, temp, load, predicted_future_temp)
 
@@ -180,8 +219,8 @@ async fn main() -> Result<()> {
         }
 
         // Frequency control
-        let target_khz = calculate_target_freq(effective_temp);
-        let rounded_khz = quantize_freq(target_khz);
+        let target_khz = calculate_target_freq(effective_temp, &freq_limits);
+        let rounded_khz = quantize_freq(target_khz, &freq_limits);
         let current_khz = read_current_freq().unwrap_or(rounded_khz);
 
         if rounded_khz != current_khz {
