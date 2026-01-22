@@ -398,3 +398,314 @@ async fn main() -> Result<()> {
     info!("Shutdown complete");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_test_config() -> Config {
+        Config {
+            thermal_zone: "thermal_zone0".to_string(),
+            predict_ahead_sec: 2.0,
+            temp_full_speed: 70,
+            temp_steep_start: 85,
+            temp_emergency: 95,
+            granularity_khz: 100_000,
+            min_freq_ratio: 0.60,
+            mid_freq_ratio: 0.72,
+        }
+    }
+
+    fn create_test_freq_limits() -> FreqLimits {
+        FreqLimits {
+            max_khz: 4_000_000,
+            mid_khz: 2_880_000,
+            min_khz: 2_400_000,
+        }
+    }
+
+    #[test]
+    fn test_config_default_values() {
+        let config = Config::default();
+        assert_eq!(config.thermal_zone, "thermal_zone6");
+        assert_eq!(config.predict_ahead_sec, 2.0);
+        assert_eq!(config.temp_full_speed, 70);
+        assert_eq!(config.temp_steep_start, 85);
+        assert_eq!(config.temp_emergency, 95);
+        assert_eq!(config.granularity_khz, 100_000);
+        assert_eq!(config.min_freq_ratio, 0.60);
+        assert_eq!(config.mid_freq_ratio, 0.72);
+    }
+
+    #[test]
+    fn test_freq_limits_calculation() {
+        let config = create_test_config();
+        let limits = create_freq_limits(&config).unwrap();
+
+        // Verify max frequency is read from system (should be > 0)
+        assert!(limits.max_khz > 0);
+
+        // Verify ratios are applied correctly
+        let expected_min = (limits.max_khz as f64 * config.min_freq_ratio).round() as u64;
+        let expected_mid = (limits.max_khz as f64 * config.mid_freq_ratio).round() as u64;
+
+        assert_eq!(limits.min_khz, expected_min);
+        assert_eq!(limits.mid_khz, expected_mid);
+
+        // Verify ordering: max > mid > min
+        assert!(limits.max_khz > limits.mid_khz);
+        assert!(limits.mid_khz > limits.min_khz);
+    }
+
+    #[test]
+    fn test_calculate_target_freq_full_speed() {
+        let limits = create_test_freq_limits();
+        let config = create_test_config();
+
+        // Below full speed threshold should return max frequency
+        let result = calculate_target_freq(60, &limits, &config);
+        assert_eq!(result, limits.max_khz);
+    }
+
+    #[test]
+    fn test_calculate_target_freq_linear_throttle() {
+        let limits = create_test_freq_limits();
+        let config = create_test_config();
+
+        // Middle of linear range (77.5°C)
+        let result = calculate_target_freq(77, &limits, &config);
+        // Should be between max and mid
+        assert!(result < limits.max_khz);
+        assert!(result >= limits.mid_khz);
+    }
+
+    #[test]
+    fn test_calculate_target_freq_steep_throttle() {
+        let limits = create_test_freq_limits();
+        let config = create_test_config();
+
+        // Middle of steep range (90°C)
+        let result = calculate_target_freq(90, &limits, &config);
+        // Should be between mid and min
+        assert!(result < limits.mid_khz);
+        assert!(result >= limits.min_khz);
+    }
+
+    #[test]
+    fn test_calculate_target_freq_emergency() {
+        let limits = create_test_freq_limits();
+        let config = create_test_config();
+
+        // At emergency threshold
+        let result = calculate_target_freq(95, &limits, &config);
+        assert_eq!(result, limits.min_khz);
+
+        // Above emergency threshold
+        let result = calculate_target_freq(100, &limits, &config);
+        assert_eq!(result, limits.min_khz);
+    }
+
+    #[test]
+    fn test_calculate_target_freq_threshold_boundaries() {
+        let limits = create_test_freq_limits();
+        let config = create_test_config();
+
+        // At full speed threshold
+        let result = calculate_target_freq(70, &limits, &config);
+        assert_eq!(result, limits.max_khz);
+
+        // At steep start threshold
+        let result = calculate_target_freq(85, &limits, &config);
+        assert_eq!(result, limits.mid_khz);
+
+        // At emergency threshold
+        let result = calculate_target_freq(95, &limits, &config);
+        assert_eq!(result, limits.min_khz);
+    }
+
+    #[test]
+    fn test_quantize_freq_rounding() {
+        let limits = create_test_freq_limits();
+        let config = create_test_config();
+
+        // Test rounding to nearest 100MHz
+        let cases = vec![
+            (3_950_000, 4_000_000),  // Round up
+            (3_949_999, 3_900_000),  // Round down
+            (3_850_000, 3_900_000),  // Round up (midpoint)
+            (3_849_999, 3_800_000),  // Round down
+            (2_450_000, 2_500_000),  // Not a multiple, round to nearest
+        ];
+
+        for (input, expected) in cases {
+            let result = quantize_freq(input, &limits, &config);
+            assert_eq!(result, expected, "Failed for input {}", input);
+        }
+    }
+
+    #[test]
+    fn test_quantize_freq_minimum_clamp() {
+        let limits = create_test_freq_limits();
+        let config = create_test_config();
+
+        // Should clamp to minimum frequency
+        let result = quantize_freq(1_000_000, &limits, &config);
+        assert_eq!(result, limits.min_khz);
+
+        let result = quantize_freq(0, &limits, &config);
+        assert_eq!(result, limits.min_khz);
+    }
+
+    #[test]
+    fn test_state_default_values() {
+        let state = State::default();
+        assert_eq!(state.k_slope, 0.5);
+        assert_eq!(state.k_load, 0.02);
+        assert!(state.error_history.is_empty());
+    }
+
+    #[test]
+    fn test_state_serialization() {
+        let state = State {
+            k_slope: 0.75,
+            k_load: 0.035,
+            error_history: vec![0.1, -0.2, 0.3, 0.0],
+        };
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&state).unwrap();
+
+        // Deserialize back
+        let deserialized: State = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.k_slope, 0.75);
+        assert_eq!(deserialized.k_load, 0.035);
+        assert_eq!(deserialized.error_history, vec![0.1, -0.2, 0.3, 0.0]);
+    }
+
+    #[test]
+    fn test_config_from_toml() {
+        let toml_str = r#"
+            thermal_zone = "thermal_zone0"
+            predict_ahead_sec = 3.0
+            temp_full_speed = 65
+            temp_steep_start = 80
+            temp_emergency = 90
+            granularity_khz = 50000
+            min_freq_ratio = 0.50
+            mid_freq_ratio = 0.70
+        "#;
+
+        let config: Config = toml::from_str(toml_str).unwrap();
+
+        assert_eq!(config.thermal_zone, "thermal_zone0");
+        assert_eq!(config.predict_ahead_sec, 3.0);
+        assert_eq!(config.temp_full_speed, 65);
+        assert_eq!(config.temp_steep_start, 80);
+        assert_eq!(config.temp_emergency, 90);
+        assert_eq!(config.granularity_khz, 50_000);
+        assert_eq!(config.min_freq_ratio, 0.50);
+        assert_eq!(config.mid_freq_ratio, 0.70);
+    }
+
+    #[test]
+    fn test_config_partial_toml_uses_defaults() {
+        let toml_str = r#"
+            thermal_zone = "thermal_zone1"
+            temp_full_speed = 75
+        "#;
+
+        let config: Config = toml::from_str(toml_str).unwrap();
+
+        // Explicit values
+        assert_eq!(config.thermal_zone, "thermal_zone1");
+        assert_eq!(config.temp_full_speed, 75);
+
+        // Default values
+        assert_eq!(config.predict_ahead_sec, 2.0);
+        assert_eq!(config.temp_steep_start, 85);
+        assert_eq!(config.min_freq_ratio, 0.60);
+    }
+
+    #[test]
+    fn test_freq_ratios_within_bounds() {
+        let config = Config::default();
+
+        // Verify frequency ratios are within reasonable bounds
+        assert!(config.min_freq_ratio >= 0.5 && config.min_freq_ratio <= 0.8);
+        assert!(config.mid_freq_ratio >= config.min_freq_ratio);
+        assert!(config.mid_freq_ratio <= 0.9);
+
+        // Verify mid is between min and 1.0
+        assert!(config.mid_freq_ratio > config.min_freq_ratio);
+        assert!(config.mid_freq_ratio < 1.0);
+    }
+
+    #[test]
+    fn test_temperature_thresholds_ordering() {
+        let config = Config::default();
+
+        // Verify temperature thresholds are in correct order
+        assert!(config.temp_full_speed < config.temp_steep_start);
+        assert!(config.temp_steep_start < config.temp_emergency);
+
+        // Verify reasonable temperature ranges (°C)
+        assert!(config.temp_full_speed >= 50 && config.temp_full_speed <= 80);
+        assert!(config.temp_steep_start >= 70 && config.temp_steep_start <= 90);
+        assert!(config.temp_emergency >= 85 && config.temp_emergency <= 100);
+    }
+
+    #[test]
+    fn test_prediction_horizon_positive() {
+        let config = Config::default();
+
+        // Prediction horizon should be positive
+        assert!(config.predict_ahead_sec > 0.0);
+        assert!(config.predict_ahead_sec <= 10.0); // Reasonable upper bound
+    }
+
+    #[test]
+    fn test_granularity_reasonable() {
+        let config = Config::default();
+
+        // Granularity should be reasonable (between 10kHz and 1MHz)
+        assert!(config.granularity_khz >= 10_000);
+        assert!(config.granularity_khz <= 1_000_000);
+    }
+
+    #[test]
+    fn test_calculate_target_freq_monotonic() {
+        let limits = create_test_freq_limits();
+        let config = create_test_config();
+
+        // Frequency should decrease monotonically as temperature increases
+        let temps = vec![60, 70, 75, 80, 85, 90, 95, 100];
+        let mut prev_freq = calculate_target_freq(temps[0], &limits, &config);
+
+        for temp in temps.iter().skip(1) {
+            let freq = calculate_target_freq(*temp, &limits, &config);
+            assert!(freq <= prev_freq, "Frequency not monotonic at {}°C", temp);
+            prev_freq = freq;
+        }
+    }
+
+    #[test]
+    fn test_freq_limits_debug_impl() {
+        let limits = create_test_freq_limits();
+        let debug_str = format!("{:?}", limits);
+        assert!(debug_str.contains("max_khz"));
+        assert!(debug_str.contains("mid_khz"));
+        assert!(debug_str.contains("min_khz"));
+    }
+
+    #[test]
+    fn test_freq_limits_clone() {
+        let limits1 = create_test_freq_limits();
+        let limits2 = limits1.clone();
+
+        assert_eq!(limits1.max_khz, limits2.max_khz);
+        assert_eq!(limits1.mid_khz, limits2.mid_khz);
+        assert_eq!(limits1.min_khz, limits2.min_khz);
+    }
+}
+
