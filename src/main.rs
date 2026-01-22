@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use log::{error, info, warn};
 use std::fs;
 use std::fs::OpenOptions;
@@ -14,6 +14,22 @@ const CPU_FREQ_DIR: &str = "/sys/devices/system/cpu";
 const STATE_FILE: &str = "/var/lib/cpu-throttle/state.json";
 const LOG_FILE: &str = "/var/log/cpu-throttle.log";
 const CONFIG_FILE: &str = "/etc/cpu-throttle/config.toml";
+
+/// Predictive control constants
+const PREDICTED_RISE_MIN: f64 = -3.0;
+const PREDICTED_RISE_MAX: f64 = 8.0;
+const LOAD_BIAS_MIN: f64 = 0.0;
+const LOAD_BIAS_MAX: f64 = 4.0;
+
+/// Adaptive tuning constants
+const ERROR_HISTORY_SIZE: usize = 10;
+const HISTORY_SIZE: usize = 20;
+const K_SLOPE_MIN: f64 = 0.1;
+const K_SLOPE_MAX: f64 = 1.5;
+const K_LOAD_MIN: f64 = 0.01;
+const K_LOAD_MAX: f64 = 0.08;
+const K_SLOPE_ADJUST: f64 = 0.05;
+const K_LOAD_ADJUST: f64 = 0.005;
 
 /// Configuration loaded from file or defaults
 #[derive(serde::Deserialize, Debug, Clone)]
@@ -68,22 +84,82 @@ impl Default for Config {
     }
 }
 
+impl Config {
+    /// Validate configuration constraints
+    fn validate(&self) -> Result<()> {
+        if self.temp_full_speed >= self.temp_steep_start {
+            bail!(
+                "Invalid temperature thresholds: temp_full_speed ({}°C) must be < temp_steep_start ({}°C)",
+                self.temp_full_speed, self.temp_steep_start
+            );
+        }
+        if self.temp_steep_start >= self.temp_emergency {
+            bail!(
+                "Invalid temperature thresholds: temp_steep_start ({}°C) must be < temp_emergency ({}°C)",
+                self.temp_steep_start, self.temp_emergency
+            );
+        }
+        if self.min_freq_ratio >= self.mid_freq_ratio {
+            bail!(
+                "Invalid frequency ratios: min_freq_ratio ({}) must be < mid_freq_ratio ({})",
+                self.min_freq_ratio, self.mid_freq_ratio
+            );
+        }
+        if self.mid_freq_ratio >= 1.0 {
+            bail!(
+                "Invalid frequency ratio: mid_freq_ratio ({}) must be < 1.0",
+                self.mid_freq_ratio
+            );
+        }
+        if self.predict_ahead_sec <= 0.0 {
+            bail!(
+                "Invalid prediction horizon: predict_ahead_sec ({}) must be > 0",
+                self.predict_ahead_sec
+            );
+        }
+        if self.granularity_khz == 0 {
+            bail!(
+                "Invalid granularity: granularity_khz must be > 0"
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Load configuration from file, falling back to defaults
 fn load_config() -> Config {
-    if let Ok(content) = fs::read_to_string(CONFIG_FILE) {
-        match toml::from_str(&content) {
-            Ok(config) => {
-                info!("Loaded configuration from {}", CONFIG_FILE);
-                return config;
+    let config = if let Ok(content) = fs::read_to_string(CONFIG_FILE) {
+        match toml::from_str::<Config>(&content) {
+            Ok(mut c) => {
+                // Ensure thermal_zone is set even if not in file
+                if c.thermal_zone.is_empty() {
+                    c.thermal_zone = default_thermal_zone();
+                }
+                if let Err(e) = c.validate() {
+                    warn!("Invalid config file: {}, using defaults", e);
+                    Config::default()
+                } else {
+                    info!("Loaded configuration from {}", CONFIG_FILE);
+                    c
+                }
             }
             Err(e) => {
                 warn!("Failed to parse config file: {}, using defaults", e);
+                Config::default()
             }
         }
     } else {
         info!("No config file found at {}, using defaults", CONFIG_FILE);
+        Config::default()
+    };
+
+    // Final validation of loaded/defaults
+    if let Err(e) = config.validate() {
+        error!("Invalid configuration: {}", e);
+        Config::default()
+    } else {
+        config
     }
-    Config::default()
 }
 
 /// Dynamic frequency limits derived from system CPU info
@@ -114,8 +190,9 @@ impl Default for State {
 async fn read_cpu_temp(thermal_zone: &str) -> Result<i32> {
     let zone_path = format!("/sys/class/thermal/{}/temp", thermal_zone);
     let content = fs::read_to_string(&zone_path)
-        .with_context(|| format!("Failed to read {}", zone_path))?;
-    let temp_millicelsius: i32 = content.trim().parse()?;
+        .with_context(|| format!("Failed to read thermal zone {}", zone_path))?;
+    let temp_millicelsius: i32 = content.trim().parse()
+        .with_context(|| format!("Invalid temperature value in {}: '{}'", zone_path, content.trim()))?;
     Ok(temp_millicelsius / 1000)
 }
 
@@ -151,6 +228,20 @@ fn create_freq_limits(config: &Config) -> Result<FreqLimits> {
     let min_khz = (max_khz as f64 * config.min_freq_ratio).round() as u64;
     let mid_khz = (max_khz as f64 * config.mid_freq_ratio).round() as u64;
 
+    // Validate ordering to prevent precision loss issues
+    if mid_khz <= min_khz {
+        bail!(
+            "Invalid frequency limits: mid ({}) <= min ({}). max={}, min_ratio={}, mid_ratio={}",
+            mid_khz, min_khz, max_khz, config.min_freq_ratio, config.mid_freq_ratio
+        );
+    }
+    if max_khz <= mid_khz {
+        bail!(
+            "Invalid frequency limits: max ({}) <= mid ({}). mid_ratio={}",
+            max_khz, mid_khz, config.mid_freq_ratio
+        );
+    }
+
     info!("CPU frequency limits: max={} MHz, mid={} MHz, min={} MHz",
           max_khz / 1000, mid_khz / 1000, min_khz / 1000);
 
@@ -178,6 +269,9 @@ fn calculate_target_freq(effective_temp: i32, limits: &FreqLimits, config: &Conf
     } else if effective_temp >= config.temp_steep_start {
         // Steep throttling: mid → min
         let range = (config.temp_emergency - config.temp_steep_start) as u64;
+        if range == 0 {
+            return limits.min_khz;
+        }
         let offset = (effective_temp - config.temp_steep_start) as u64;
         let step = (limits.mid_khz - limits.min_khz) / range;
         let khz = limits.mid_khz - offset * step;
@@ -185,6 +279,9 @@ fn calculate_target_freq(effective_temp: i32, limits: &FreqLimits, config: &Conf
     } else if effective_temp > config.temp_full_speed {
         // Linear throttling: max → mid
         let range = (config.temp_steep_start - config.temp_full_speed) as u64;
+        if range == 0 {
+            return limits.mid_khz;
+        }
         let offset = (effective_temp - config.temp_full_speed) as u64;
         let step = (limits.max_khz - limits.mid_khz) / range;
         let khz = limits.max_khz - offset * step;
@@ -303,9 +400,11 @@ async fn main() -> Result<()> {
             0.0
         };
 
-        // Predictive control using config values
-        let predicted_rise = (temp_slope * config.predict_ahead_sec * state.k_slope).clamp(-3.0, 8.0);
-        let load_bias = (cpu_load as f64 * state.k_load).clamp(0.0, 4.0);
+        // Predictive control using config values and constants
+        let predicted_rise = (temp_slope * config.predict_ahead_sec * state.k_slope)
+            .clamp(PREDICTED_RISE_MIN, PREDICTED_RISE_MAX);
+        let load_bias = (cpu_load as f64 * state.k_load)
+            .clamp(LOAD_BIAS_MIN, LOAD_BIAS_MAX);
         let effective_temp = (temp_c as f64 + predicted_rise + load_bias).round() as i32;
 
         // Check prediction accuracy (use closest match within 1-3 seconds ago)
@@ -318,15 +417,17 @@ async fn main() -> Result<()> {
 
             // Update self-tuning parameters
             state.error_history.push(err);
-            if state.error_history.len() > 10 {
+            if state.error_history.len() > ERROR_HISTORY_SIZE {
                 state.error_history.remove(0);
             }
 
             if !state.error_history.is_empty() {
                 let avg_err: f64 =
                     state.error_history.iter().sum::<f64>() / state.error_history.len() as f64;
-                state.k_slope = (state.k_slope - 0.05 * avg_err).clamp(0.1, 1.5);
-                state.k_load = (state.k_load - 0.005 * avg_err).clamp(0.01, 0.08);
+                state.k_slope = (state.k_slope - K_SLOPE_ADJUST * avg_err)
+                    .clamp(K_SLOPE_MIN, K_SLOPE_MAX);
+                state.k_load = (state.k_load - K_LOAD_ADJUST * avg_err)
+                    .clamp(K_LOAD_MIN, K_LOAD_MAX);
             }
 
             save_state(&state).await?;
@@ -346,7 +447,7 @@ async fn main() -> Result<()> {
         // Save history
         let predicted_future_temp = temp_c as f64 + predicted_rise;
         history.push((now, temp_c, cpu_load, predicted_future_temp));
-        if history.len() > 20 {
+        if history.len() > HISTORY_SIZE {
             history.remove(0);
         }
 
@@ -364,16 +465,24 @@ async fn main() -> Result<()> {
             state.k_slope, state.k_load
         ));
 
-        // Write to log file using buffered writer
-        if let Ok(mut writer) = log_writer.lock() {
-            let _ = writeln!(
-                writer,
-                "{} | {}",
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-                log_msg
-            );
-            // Flush periodically to ensure data is written
-            let _ = writer.flush();
+        // Write to log file using buffered writer with proper error handling
+        match log_writer.lock() {
+            Ok(mut writer) => {
+                if let Err(e) = writeln!(
+                    writer,
+                    "{} | {}",
+                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                    log_msg
+                ) {
+                    error!("Failed to write to log file: {}", e);
+                }
+                if let Err(e) = writer.flush() {
+                    error!("Failed to flush log file: {}", e);
+                }
+            }
+            Err(e) => {
+                error!("Failed to acquire log writer lock: {}", e);
+            }
         }
 
         info!("{}", log_msg);
