@@ -98,7 +98,7 @@ Create `/etc/systemd/system/cpu-throttle.service`:
 ```ini
 [Unit]
 Description=Predictive CPU Thermal Control Daemon
-Documentation=https://github.com/yourusername/cpu-throttle
+Documentation=https://github.com/unclemate/cpu-throttle
 After=multi-user.target
 Wants=network-online.target
 
