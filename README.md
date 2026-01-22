@@ -93,6 +93,87 @@ sudo ./target/release/cpu-throttle
 sudo cpu-throttle
 ```
 
+### CLI Commands
+
+#### Validate Configuration
+
+Before starting the daemon, validate your configuration file:
+
+```bash
+# Validate default config location (/etc/cpu-throttle/config.toml)
+sudo cpu-throttle validate-config
+
+# Validate a custom config file
+sudo cpu-throttle validate-config --config /path/to/custom-config.toml
+
+# Validate the example configuration
+cpu-throttle validate-config --config config.example.toml
+```
+
+**Example output:**
+```
+Validating configuration file: config.example.toml
+✓ Configuration is valid!
+
+Current settings:
+  thermal_zone        : thermal_zone6
+  predict_ahead_sec   : 2 seconds
+  temp_full_speed     : 70°C
+  temp_steep_start    : 85°C
+  temp_emergency      : 95°C
+  granularity_khz     : 100 MHz
+  min_freq_ratio      : 0.6 (60%)
+  mid_freq_ratio      : 0.72 (72%)
+
+Derived frequency limits:
+  max_frequency       : 3900 MHz
+  mid_frequency       : 2808 MHz
+  min_frequency       : 2340 MHz
+```
+
+#### Generate Configuration
+
+Generate a new configuration file with default values:
+
+```bash
+# Generate to default location (/etc/cpu-throttle/config.toml)
+sudo cpu-throttle generate-config
+
+# Generate to a custom location
+cpu-throttle generate-config --output /path/to/config.toml
+```
+
+**Example output:**
+```
+✓ Generated default configuration file: /etc/cpu-throttle/config.toml
+
+Review and adjust the following settings:
+  thermal_zone        : thermal_zone6
+  predict_ahead_sec   : 2 seconds
+  temp_full_speed     : 70°C
+  temp_steep_start    : 85°C
+  temp_emergency      : 95°C
+  granularity_khz     : 100 MHz
+  min_freq_ratio      : 0.6 (60%)
+  mid_freq_ratio      : 0.72 (72%)
+
+Validate the configuration with:
+  sudo cpu-throttle validate-config --config /etc/cpu-throttle/config.toml
+```
+
+**Note:** The command will fail if the file already exists. Remove the existing file first if you want to regenerate it.
+
+#### Help and Version
+
+```bash
+# Show help
+cpu-throttle --help
+cpu-throttle validate-config --help
+
+# Show version
+cpu-throttle --version
+```
+
 ### Systemd Service Deployment
 
 For automatic startup at boot, deploy as a systemd service.
@@ -164,27 +245,52 @@ sudo systemctl disable cpu-throttle
 
 ## Configuration
 
-The daemon uses compile-time constants defined in `src/main.rs`:
+The daemon can be configured via a TOML configuration file at `/etc/cpu-throttle/config.toml`. If the file doesn't exist, the daemon uses built-in defaults.
 
-| Constant | Default | Description |
-|----------|---------|-------------|
-| `THERMAL_ZONE` | `thermal_zone6` | Path to CPU temperature sensor |
-| `PREDICT_AHEAD_SEC` | `2.0` | Prediction horizon in seconds |
-| `TEMP_FULL_SPEED` | `70` | Max frequency temperature threshold (°C) |
-| `TEMP_STEEP_START` | `85` | Aggressive throttle start (°C) |
-| `TEMP_EMERGENCY` | `95` | Emergency mode threshold (°C) |
-| `MIN_FREQ_RATIO` | `0.60` | Minimum frequency as ratio of CPU max |
-| `MID_FREQ_RATIO` | `0.72` | Mid frequency as ratio of CPU max |
-| `GRANULARITY_KHZ` | `100_000` | Frequency adjustment step (Hz) |
+### Configuration File
 
-**Note:** CPU maximum frequency is read automatically from
-`/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq`.
+Create a configuration file using either method:
 
-**Note**: You may need to adjust `THERMAL_ZONE` depending on your hardware. Check available zones with:
+**Option 1: Generate default configuration**
 ```bash
-ls /sys/class/thermal/
-cat /sys/class/thermal/thermal_zone6/type  # Verify it's CPU-related
+sudo mkdir -p /etc/cpu-throttle
+sudo cpu-throttle generate-config
+sudo editor /etc/cpu-throttle/config.toml
 ```
+
+**Option 2: Copy example configuration**
+```bash
+sudo mkdir -p /etc/cpu-throttle
+sudo cp config.example.toml /etc/cpu-throttle/config.toml
+sudo editor /etc/cpu-throttle/config.toml
+```
+
+**Validate your configuration before starting the daemon:**
+
+```bash
+sudo cpu-throttle validate-config
+```
+
+### Configuration Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `thermal_zone` | `thermal_zone6` | Path to CPU temperature sensor |
+| `predict_ahead_sec` | `2.0` | Prediction horizon in seconds |
+| `temp_full_speed` | `70` | Max frequency temperature threshold (°C) |
+| `temp_steep_start` | `85` | Aggressive throttle start (°C) |
+| `temp_emergency` | `95` | Emergency mode threshold (°C) |
+| `min_freq_ratio` | `0.60` | Minimum frequency as ratio of CPU max |
+| `mid_freq_ratio` | `0.72` | Mid frequency as ratio of CPU max |
+| `granularity_khz` | `100_000` | Frequency adjustment step (Hz) |
+
+**Notes:**
+- CPU maximum frequency is read automatically from `/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq`
+- You may need to adjust `thermal_zone` depending on your hardware. Check available zones with:
+  ```bash
+  ls /sys/class/thermal/
+  cat /sys/class/thermal/thermal_zone6/type  # Verify it's CPU-related
+  ```
 
 ## Data Files
 
