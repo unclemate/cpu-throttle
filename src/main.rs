@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use log::{error, info, warn};
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::signal;
 use tokio::time;
@@ -155,11 +157,13 @@ async fn load_state() -> Result<State> {
 async fn main() -> Result<()> {
     env_logger::init();
 
-    // Ensure log file exists
-    fs::OpenOptions::new()
+    // Open log file with buffered writer for better performance
+    let log_file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(LOG_FILE)?;
+        .open(LOG_FILE)
+        .context("Failed to open log file")?;
+    let log_writer = Arc::new(Mutex::new(BufWriter::new(log_file)));
 
     let mut state = load_state().await.unwrap_or_else(|e| {
         warn!("Failed to load state: {}, using defaults", e);
@@ -293,15 +297,17 @@ async fn main() -> Result<()> {
             state.k_slope, state.k_load
         ));
 
-        // Write to log file
-        let mut file = fs::OpenOptions::new().append(true).open(LOG_FILE)?;
-        use std::io::Write;
-        writeln!(
-            file,
-            "{} | {}",
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-            log_msg
-        )?;
+        // Write to log file using buffered writer
+        if let Ok(mut writer) = log_writer.lock() {
+            let _ = writeln!(
+                writer,
+                "{} | {}",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                log_msg
+            );
+            // Flush periodically to ensure data is written
+            let _ = writer.flush();
+        }
 
         info!("{}", log_msg);
 
