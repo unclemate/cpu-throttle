@@ -15,8 +15,10 @@ source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
         "$pkgname.service"
         "$pkgname.tmpfiles"
         "$pkgname.install")
-# 本地测试：使用 SKIP 跳过校验，正式发布需运行 updpkgsums
-b2sums=('SKIP' 'SKIP' 'SKIP' 'SKIP')
+b2sums=('8181e4989a16901232d0085fdfb24906dd902bf86f598757e9de27368e63d41a616832b928934fdb273f3853acf23af24f58f1cef7cd885af9535565b20a7d48'
+        '74e0d9af1c3b00885d2d99f2a5bb2ee87b75ef2ea13d3d30f03f5602ebf7fa9af29f9b4ed3869ff4f7c6474e8c2a0723cb350e713dce8c6d307a7bad26aab692'
+        '025a62fe4c9fa9cdf0ff30b013a9745038c72018799d36c265ae6bc288bbd141a7a99da2061fc97357e5a9391a31a8af5c0f643d655cbc96c31d311527ae1021'
+        '048cfdb50e894b3c5a77eb28aeaf1838f66bef912fbc574306370f2de7ca1985012c9359b9f700c34b6411a72a6afc35eda943571885da39a9db8ff4f87f2c5c')
 
 # 本地构建模式（uncomment for local testing）:
 # source=(".local" "$pkgname.service" "$pkgname.tmpfiles" "$pkgname.install")
