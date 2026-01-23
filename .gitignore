@@ -23,3 +23,13 @@ target
 
 # Project documentation (private)
 CLAUDE.md
+
+# Arch Linux package build artifacts (in aur/ directory)
+aur/pkg/
+aur/src/
+aur/*.pkg.tar.zst
+aur/*.tar.gz
+aur/.SRCINFO
+
+# Local build files
+aur/PKGBUILD.local

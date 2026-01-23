@@ -1,0 +1,26 @@
+post_install() {
+    echo ":: 配置文件位于 /etc/cpu-throttle/config.toml"
+    echo ":: 在启用服务前，请验证配置文件:"
+    echo "   sudo cpu-throttle validate-config"
+    echo ""
+    echo ":: 启用并启动服务:"
+    echo "   sudo systemctl enable cpu-throttle"
+    echo "   sudo systemctl start cpu-throttle"
+}
+
+post_upgrade() {
+    echo ":: 如果配置文件有变化，请验证配置:"
+    echo "   sudo cpu-throttle validate-config"
+    echo ""
+    echo ":: 如果服务正在运行，考虑重启:"
+    echo "   sudo systemctl restart cpu-throttle"
+}
+
+pre_remove() {
+    if systemctl is-active --quiet cpu-throttle; then
+        systemctl stop cpu-throttle
+    fi
+    if systemctl is-enabled --quiet cpu-throttle; then
+        systemctl disable cpu-throttle
+    fi
+}

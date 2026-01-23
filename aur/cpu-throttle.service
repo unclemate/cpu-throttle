@@ -1,0 +1,22 @@
+[Unit]
+Description=Predictive CPU Thermal Control Daemon
+Documentation=https://github.com/unclemate/cpu-throttle
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/cpu-throttle
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# 安全加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/cpu-throttle /var/log/cpu-throttle.log
+
+[Install]
+WantedBy=multi-user.target
