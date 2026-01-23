@@ -296,6 +296,8 @@ sudo cpu-throttle validate-config
 
 ### Log File (`/var/log/cpu-throttle.log`)
 
+**Log Rotation Strategy (KISS):** The log file is automatically truncated on each daemon startup, keeping only logs from the current session. This simple approach avoids complex rotation logic while ensuring logs remain fresh and manageable.
+
 The daemon continuously appends operational logs with the following format:
 
 ```
