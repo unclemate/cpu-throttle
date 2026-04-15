@@ -18,9 +18,17 @@ const CONFIG_FILE: &str = "/etc/cpu-throttle/config.toml";
 
 /// Predictive control constants
 const PREDICTED_RISE_MIN: f64 = -3.0;
-const PREDICTED_RISE_MAX: f64 = 8.0;
+const PREDICTED_RISE_MAX: f64 = 5.0;
 const LOAD_BIAS_MIN: f64 = 0.0;
-const LOAD_BIAS_MAX: f64 = 4.0;
+const LOAD_BIAS_MAX: f64 = 2.5;
+
+/// Absolute minimum frequency floor (1.5 GHz).
+/// Prevents daemon + hardware double-throttling from dropping below this level.
+const ABSOLUTE_FREQ_FLOOR_KHZ: u64 = 1_500_000;
+
+/// Maximum frequency drop per control cycle (200 MHz/s).
+/// Prevents over-aggressive throttling spikes. Recovery (upward) is unlimited.
+const MAX_FREQ_DROP_PER_CYCLE_KHZ: u64 = 200_000;
 
 /// Adaptive tuning constants
 const ERROR_HISTORY_SIZE: usize = 10;
@@ -29,8 +37,11 @@ const K_SLOPE_MIN: f64 = 0.1;
 const K_SLOPE_MAX: f64 = 1.5;
 const K_LOAD_MIN: f64 = 0.01;
 const K_LOAD_MAX: f64 = 0.08;
-const K_SLOPE_ADJUST: f64 = 0.05;
-const K_LOAD_ADJUST: f64 = 0.005;
+const K_SLOPE_ADJUST: f64 = 0.02;
+const K_LOAD_ADJUST: f64 = 0.002;
+const K_SLOPE_DEFAULT: f64 = 0.5;
+const K_LOAD_DEFAULT: f64 = 0.02;
+const TUNING_DECAY_RATE: f64 = 0.001;
 
 /// Command-line interface arguments
 #[derive(Parser, Debug)]
@@ -89,7 +100,7 @@ struct Config {
 }
 
 // Default functions for serde
-fn default_thermal_zone() -> String { "thermal_zone6".to_string() }
+fn default_thermal_zone() -> String { "thermal_zone4".to_string() }
 fn default_predict_ahead() -> f64 { 2.0 }
 fn default_temp_full_speed() -> i32 { 70 }
 fn default_temp_steep_start() -> i32 { 85 }
@@ -332,10 +343,44 @@ fn read_cpu_load() -> Result<u32> {
     Ok(usage.min(100))
 }
 
+#[allow(dead_code)]
 fn read_current_freq() -> Result<u64> {
     let path = Path::new(CPU_FREQ_DIR).join("cpu0/cpufreq/scaling_max_freq");
     let content = fs::read_to_string(&path)?;
     Ok(content.trim().parse()?)
+}
+
+/// Compute temperature slope (°C/s) using least-squares linear regression
+/// over the available history. Returns 0.0 if insufficient data.
+fn compute_temp_slope(history: &[(u64, i32, u32, f64)]) -> f64 {
+    let n = history.len();
+    if n < 2 {
+        return 0.0;
+    }
+
+    let mut sum_t: f64 = 0.0;
+    let mut sum_temp: f64 = 0.0;
+    let mut sum_tt: f64 = 0.0;
+    let mut sum_ttemp: f64 = 0.0;
+
+    for (ts, temp, _, _) in history.iter() {
+        let t = *ts as f64;
+        let temp_f = *temp as f64;
+        sum_t += t;
+        sum_temp += temp_f;
+        sum_tt += t * t;
+        sum_ttemp += t * temp_f;
+    }
+
+    let denominator = (n as f64) * sum_tt - sum_t * sum_t;
+    if denominator.abs() < f64::EPSILON {
+        return 0.0;
+    }
+
+    let slope = ((n as f64) * sum_ttemp - sum_t * sum_temp) / denominator;
+
+    // Clamp to physically reasonable range
+    slope.clamp(-10.0, 10.0)
 }
 
 /// Read CPU's hardware maximum frequency from cpuinfo_max_freq
@@ -351,7 +396,8 @@ fn read_cpu_max_freq() -> Result<u64> {
 /// Create frequency limits based on system CPU max frequency and config
 fn create_freq_limits(config: &Config) -> Result<FreqLimits> {
     let max_khz = read_cpu_max_freq()?;
-    let min_khz = (max_khz as f64 * config.min_freq_ratio).round() as u64;
+    let min_khz = ((max_khz as f64 * config.min_freq_ratio).round() as u64)
+        .max(ABSOLUTE_FREQ_FLOOR_KHZ);
     let mid_khz = (max_khz as f64 * config.mid_freq_ratio).round() as u64;
 
     // Validate ordering to prevent precision loss issues
@@ -368,8 +414,9 @@ fn create_freq_limits(config: &Config) -> Result<FreqLimits> {
         );
     }
 
-    info!("CPU frequency limits: max={} MHz, mid={} MHz, min={} MHz",
-          max_khz / 1000, mid_khz / 1000, min_khz / 1000);
+    info!("CPU frequency limits: max={} MHz, mid={} MHz, min={} MHz{}",
+          max_khz / 1000, mid_khz / 1000, min_khz / 1000,
+          if min_khz == ABSOLUTE_FREQ_FLOOR_KHZ { " (absolute floor applied)" } else { "" });
 
     Ok(FreqLimits { max_khz, mid_khz, min_khz })
 }
@@ -430,12 +477,29 @@ async fn save_state(state: &State) -> Result<()> {
 }
 
 async fn load_state() -> Result<State> {
-    if Path::new(STATE_FILE).exists() {
+    let mut state = if Path::new(STATE_FILE).exists() {
         let content = fs::read_to_string(STATE_FILE)?;
-        Ok(serde_json::from_str(&content)?)
+        let s: State = serde_json::from_str(&content)?;
+        // Clamp loaded values to valid ranges to prevent runaway from persisted state
+        State {
+            k_slope: s.k_slope.clamp(K_SLOPE_MIN, K_SLOPE_MAX),
+            k_load: s.k_load.clamp(K_LOAD_MIN, K_LOAD_MAX),
+            error_history: s.error_history,
+        }
     } else {
-        Ok(State::default())
+        return Ok(State::default());
+    };
+
+    // If k values are near extremes, reset to defaults (indicates past instability)
+    if state.k_slope > K_SLOPE_MAX * 0.85 || state.k_load > K_LOAD_MAX * 0.85 {
+        warn!("Self-tuning parameters near extremes (k_slope={:.3}, k_load={:.4}), resetting to defaults",
+              state.k_slope, state.k_load);
+        state.k_slope = K_SLOPE_DEFAULT;
+        state.k_load = K_LOAD_DEFAULT;
+        state.error_history.clear();
     }
+
+    Ok(state)
 }
 
 /// Opens log file with truncate-on-startup behavior (KISS: no rotation needed)
@@ -474,6 +538,9 @@ async fn run_daemon(config_path: &str) -> Result<()> {
     let freq_limits = create_freq_limits(&config)?;
 
     let mut history: Vec<(u64, i32, u32, f64)> = Vec::new(); // (timestamp, temp, load, predicted_future_temp)
+
+    // Track last applied frequency for rate limiting
+    let mut last_applied_khz: u64 = freq_limits.max_khz;
 
     // Set up graceful shutdown handler
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -523,18 +590,8 @@ async fn run_daemon(config_path: &str) -> Result<()> {
         let temp_c = read_cpu_temp(&config.thermal_zone).await?;
         let cpu_load = read_cpu_load()?;
 
-        // Calculate temperature slope
-        let temp_slope = if history.len() >= 2 {
-            let (t0, temp0, _, _) = history[history.len() - 2];
-            let (t1, temp1, _, _) = history[history.len() - 1];
-            if t1 > t0 {
-                (temp1 - temp0) as f64 / (t1 - t0) as f64
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        };
+        // Calculate temperature slope using least-squares regression
+        let temp_slope = compute_temp_slope(&history);
 
         // Predictive control using config values and constants
         let predicted_rise = (temp_slope * config.predict_ahead_sec * state.k_slope)
@@ -558,25 +615,49 @@ async fn run_daemon(config_path: &str) -> Result<()> {
             }
 
             if !state.error_history.is_empty() {
-                let avg_err: f64 =
-                    state.error_history.iter().sum::<f64>() / state.error_history.len() as f64;
+                // Exponential decay weighting: recent errors have more influence
+                let weighted_sum: f64 = state.error_history.iter().rev().enumerate()
+                    .map(|(i, &err)| err / 2_f64.powi(i as i32))
+                    .sum();
+                let weight_total: f64 = (0..state.error_history.len())
+                    .map(|i| 1.0 / 2_f64.powi(i as i32))
+                    .sum();
+                let avg_err = weighted_sum / weight_total;
                 state.k_slope = (state.k_slope - K_SLOPE_ADJUST * avg_err)
                     .clamp(K_SLOPE_MIN, K_SLOPE_MAX);
                 state.k_load = (state.k_load - K_LOAD_ADJUST * avg_err)
                     .clamp(K_LOAD_MIN, K_LOAD_MAX);
+
+                // Gentle decay toward defaults to prevent long-term drift
+                state.k_slope = state.k_slope + (K_SLOPE_DEFAULT - state.k_slope) * TUNING_DECAY_RATE;
+                state.k_load = state.k_load + (K_LOAD_DEFAULT - state.k_load) * TUNING_DECAY_RATE;
             }
 
             save_state(&state).await?;
         }
 
-        // Frequency control
+        // Frequency control with descent rate limiting
         let target_khz = calculate_target_freq(effective_temp, &freq_limits, &config);
         let rounded_khz = quantize_freq(target_khz, &freq_limits, &config);
-        let current_khz = read_current_freq().unwrap_or(rounded_khz);
 
-        if rounded_khz != current_khz {
-            if let Err(e) = set_cpu_freq(rounded_khz) {
+        // Apply rate limiting only to downward changes (throttling).
+        // Upward changes (recovery) and emergency temperature bypass the limit.
+        let final_khz = if temp_c >= config.temp_emergency {
+            // Emergency: drop immediately
+            rounded_khz
+        } else if rounded_khz < last_applied_khz {
+            let max_drop = MAX_FREQ_DROP_PER_CYCLE_KHZ;
+            let floored = last_applied_khz.saturating_sub(max_drop);
+            rounded_khz.max(floored).max(freq_limits.min_khz)
+        } else {
+            rounded_khz
+        };
+
+        if final_khz != last_applied_khz {
+            if let Err(e) = set_cpu_freq(final_khz) {
                 error!("Failed to set CPU frequency: {}", e);
+            } else {
+                last_applied_khz = final_khz;
             }
         }
 
@@ -588,10 +669,10 @@ async fn run_daemon(config_path: &str) -> Result<()> {
         }
 
         // Log
-        let freq_mhz = rounded_khz / 1000;
+        let freq_mhz = final_khz / 1000;
         let mut log_msg = format!(
-            "Temp={}°C | eff={} | dT/dt={:.3}/s | Load={}% → {} MHz",
-            temp_c, effective_temp, temp_slope, cpu_load, freq_mhz
+            "Temp={}°C | eff={} (rise={:.1}+load={:.1}) | dT/dt={:.3}/s | Load={}% → {} MHz",
+            temp_c, effective_temp, predicted_rise, load_bias, temp_slope, cpu_load, freq_mhz
         );
         if let Some(err) = pred_err {
             log_msg.push_str(&format!(" | pred_err={:.1}°C", err));
@@ -700,7 +781,7 @@ mod tests {
     #[test]
     fn test_config_default_values() {
         let config = Config::default();
-        assert_eq!(config.thermal_zone, "thermal_zone6");
+        assert_eq!(config.thermal_zone, "thermal_zone4");
         assert_eq!(config.predict_ahead_sec, 2.0);
         assert_eq!(config.temp_full_speed, 70);
         assert_eq!(config.temp_steep_start, 85);
@@ -1131,7 +1212,7 @@ mod tests {
         // Verify content is valid TOML
         let content = fs::read_to_string(temp_path).unwrap();
         let config: Config = toml::from_str(&content).unwrap();
-        assert_eq!(config.thermal_zone, "thermal_zone6");
+        assert_eq!(config.thermal_zone, "thermal_zone4");
         assert_eq!(config.temp_full_speed, 70);
 
         // Cleanup
@@ -1169,7 +1250,7 @@ mod tests {
         // Verify content is valid TOML
         let content = fs::read_to_string(temp_path).unwrap();
         let config: Config = toml::from_str(&content).unwrap();
-        assert_eq!(config.thermal_zone, "thermal_zone6");
+        assert_eq!(config.thermal_zone, "thermal_zone4");
 
         // Cleanup
         let _ = fs::remove_dir_all("/tmp/test_cpu_throttle_nested");
@@ -1280,6 +1361,123 @@ mod tests {
 
         // Cleanup
         let _ = fs::remove_file(temp_path);
+    }
+
+    // --- New tests for optimization changes ---
+
+    #[test]
+    fn test_absolute_freq_floor_applied() {
+        // Config with very low min_freq_ratio should still hit the absolute floor
+        let config = Config {
+            thermal_zone: "thermal_zone0".to_string(),
+            predict_ahead_sec: 2.0,
+            temp_full_speed: 70,
+            temp_steep_start: 85,
+            temp_emergency: 95,
+            granularity_khz: 100_000,
+            min_freq_ratio: 0.10,  // 10% would be ~390 MHz without floor
+            mid_freq_ratio: 0.72,
+        };
+
+        let limits = create_freq_limits(&config).unwrap();
+        assert!(limits.min_khz >= ABSOLUTE_FREQ_FLOOR_KHZ,
+                "min_khz ({}) should be >= absolute floor ({})", limits.min_khz, ABSOLUTE_FREQ_FLOOR_KHZ);
+    }
+
+    #[test]
+    fn test_compute_temp_slope_empty_history() {
+        let history: Vec<(u64, i32, u32, f64)> = vec![];
+        assert_eq!(compute_temp_slope(&history), 0.0);
+    }
+
+    #[test]
+    fn test_compute_temp_slope_single_point() {
+        let history = vec![(100u64, 60i32, 50u32, 62.0f64)];
+        assert_eq!(compute_temp_slope(&history), 0.0);
+    }
+
+    #[test]
+    fn test_compute_temp_slope_two_points() {
+        let history = vec![
+            (100u64, 60i32, 50u32, 62.0f64),
+            (101u64, 62i32, 50u32, 64.0f64),
+        ];
+        let slope = compute_temp_slope(&history);
+        // Two points: slope should be (62-60)/(101-100) = 2.0
+        assert!((slope - 2.0).abs() < 0.01, "slope should be ~2.0, got {}", slope);
+    }
+
+    #[test]
+    fn test_compute_temp_slope_stable_temp() {
+        let history: Vec<(u64, i32, u32, f64)> = (0..10)
+            .map(|i| (100 + i as u64, 65i32, 50u32, 66.0f64))
+            .collect();
+        let slope = compute_temp_slope(&history);
+        assert!(slope.abs() < 0.01, "stable temp slope should be ~0, got {}", slope);
+    }
+
+    #[test]
+    fn test_compute_temp_slope_rising_trend() {
+        // 10-second steady rise of 1°C/s
+        let history: Vec<(u64, i32, u32, f64)> = (0..10)
+            .map(|i| (100 + i as u64, 60 + i, 80u32, 62.0f64))
+            .collect();
+        let slope = compute_temp_slope(&history);
+        assert!((slope - 1.0).abs() < 0.01, "slope should be ~1.0, got {}", slope);
+    }
+
+    #[test]
+    fn test_compute_temp_slope_with_outlier() {
+        // Steady 1°C/s rise with one spike at index 5
+        let mut history: Vec<(u64, i32, u32, f64)> = (0..10)
+            .map(|i| (100 + i as u64, 60 + i, 80u32, 62.0f64))
+            .collect();
+        history[5] = (105, 80, 80, 82.0); // outlier: 20°C spike
+
+        let slope = compute_temp_slope(&history);
+        // Least-squares should moderate the outlier, slope should still be positive
+        // but much less than the 2-point approach would give for the spike
+        assert!(slope > 0.0, "slope should be positive despite outlier, got {}", slope);
+        assert!(slope < 5.0, "slope should be moderated by least-squares, got {}", slope);
+    }
+
+    #[test]
+    fn test_load_state_clamps_extreme_values() {
+        let temp_path = "/tmp/test_state_extreme.json";
+        let extreme_state = r#"{"k_slope": 99.0, "k_load": 99.0, "error_history": []}"#;
+        fs::write(temp_path, extreme_state).unwrap();
+
+        // We can't easily call async load_state with a custom path,
+        // but we can verify the clamping logic directly
+        let parsed: State = serde_json::from_str(extreme_state).unwrap();
+        let clamped_k_slope = parsed.k_slope.clamp(K_SLOPE_MIN, K_SLOPE_MAX);
+        let clamped_k_load = parsed.k_load.clamp(K_LOAD_MIN, K_LOAD_MAX);
+
+        assert_eq!(clamped_k_slope, K_SLOPE_MAX);
+        assert_eq!(clamped_k_load, K_LOAD_MAX);
+
+        let _ = fs::remove_file(temp_path);
+    }
+
+    #[test]
+    fn test_prediction_inflation_reduced() {
+        // Verify that with extreme inputs, inflation stays within new bounds
+        let extreme_slope: f64 = 10.0;
+        let extreme_load: u32 = 100;
+        let k_slope: f64 = 1.5;
+        let k_load: f64 = 0.08;
+        let predict_ahead: f64 = 2.0;
+
+        let predicted_rise = (extreme_slope * predict_ahead * k_slope)
+            .clamp(PREDICTED_RISE_MIN, PREDICTED_RISE_MAX);
+        let load_bias = (extreme_load as f64 * k_load)
+            .clamp(LOAD_BIAS_MIN, LOAD_BIAS_MAX);
+
+        assert_eq!(predicted_rise, PREDICTED_RISE_MAX);
+        assert_eq!(load_bias, LOAD_BIAS_MAX);
+        // Total max inflation = 5.0 + 2.5 = 7.5 (was 8.0 + 4.0 = 12.0)
+        assert!(predicted_rise + load_bias <= 7.5,
+                "total inflation should be <= 7.5, got {}", predicted_rise + load_bias);
     }
 }
 

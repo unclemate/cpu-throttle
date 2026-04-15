@@ -116,7 +116,7 @@ Validating configuration file: config.example.toml
 ✓ Configuration is valid!
 
 Current settings:
-  thermal_zone        : thermal_zone6
+  thermal_zone        : thermal_zone4
   predict_ahead_sec   : 2 seconds
   temp_full_speed     : 70°C
   temp_steep_start    : 85°C
@@ -148,7 +148,7 @@ cpu-throttle generate-config --output /path/to/config.toml
 ✓ Generated default configuration file: /etc/cpu-throttle/config.toml
 
 Review and adjust the following settings:
-  thermal_zone        : thermal_zone6
+  thermal_zone        : thermal_zone4
   predict_ahead_sec   : 2 seconds
   temp_full_speed     : 70°C
   temp_steep_start    : 85°C
@@ -275,7 +275,7 @@ sudo cpu-throttle validate-config
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `thermal_zone` | `thermal_zone6` | Path to CPU temperature sensor |
+| `thermal_zone` | `thermal_zone4` | Path to CPU temperature sensor |
 | `predict_ahead_sec` | `2.0` | Prediction horizon in seconds |
 | `temp_full_speed` | `70` | Max frequency temperature threshold (°C) |
 | `temp_steep_start` | `85` | Aggressive throttle start (°C) |
@@ -289,7 +289,7 @@ sudo cpu-throttle validate-config
 - You may need to adjust `thermal_zone` depending on your hardware. Check available zones with:
   ```bash
   ls /sys/class/thermal/
-  cat /sys/class/thermal/thermal_zone6/type  # Verify it's CPU-related
+  cat /sys/class/thermal/thermal_zone4/type  # Verify it's CPU-related
   ```
 
 ## Data Files

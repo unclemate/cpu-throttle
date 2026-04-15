@@ -3,7 +3,7 @@
 
 # Thermal zone path (without /sys/class/thermal/ prefix)
 # Run: ls /sys/class/thermal/ to see available zones
-thermal_zone = "thermal_zone6"
+thermal_zone = "thermal_zone4"
 
 # Prediction horizon in seconds (how far ahead to predict temperature)
 predict_ahead_sec = 2.0
@@ -11,10 +11,10 @@ predict_ahead_sec = 2.0
 # Temperature thresholds for frequency control (°C)
 temp_full_speed = 70   # Below this: run at full speed
 temp_steep_start = 85  # Start aggressive throttling
-temp_emergency = 95    # Emergency minimum frequency
+temp_emergency = 92    # Emergency minimum frequency
 
 # Frequency ratios (relative to CPU max frequency)
-min_freq_ratio = 0.60  # Minimum frequency = 60% of max
+min_freq_ratio = 0.55  # Minimum frequency = 55% of max
 mid_freq_ratio = 0.72  # Mid frequency = ~72% of max
 
 # Frequency adjustment granularity (Hz)
