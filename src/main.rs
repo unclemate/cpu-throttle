@@ -324,6 +324,30 @@ impl Default for State {
     }
 }
 
+/// Known CPU temperature sensor types, in priority order.
+/// Used for auto-detection when config thermal_zone is not a recognized CPU sensor.
+const CPU_TEMP_TYPES: &[&str] = &["x86_pkg_temp", "soc_thermal"];
+
+/// Auto-detect the best thermal zone for CPU temperature.
+/// Scans /sys/class/thermal/thermal_zone*/type for known CPU sensor types.
+/// Returns zone directory name (e.g. "thermal_zone5") if found.
+fn detect_cpu_thermal_zone() -> Option<String> {
+    for prio_type in CPU_TEMP_TYPES {
+        for entry in fs::read_dir("/sys/class/thermal").ok()? {
+            let entry = entry.ok()?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with("thermal_zone") { continue; }
+            let type_path = entry.path().join("type");
+            if let Ok(zone_type) = fs::read_to_string(&type_path) {
+                if zone_type.trim() == *prio_type {
+                    return Some(name);
+                }
+            }
+        }
+    }
+    None
+}
+
 async fn read_cpu_temp(thermal_zone: &str) -> Result<i32> {
     let zone_path = format!("/sys/class/thermal/{}/temp", thermal_zone);
     let content = fs::read_to_string(&zone_path)
@@ -522,8 +546,32 @@ async fn run_daemon(config_path: &str) -> Result<()> {
 
     // Load configuration from file or use defaults
     let config = load_config(config_path);
-    info!("Using configuration: thermal_zone={}, predict_ahead_sec={}s, temp_full_speed={}°C",
-          config.thermal_zone, config.predict_ahead_sec, config.temp_full_speed);
+
+    // Resolve effective thermal zone: validate config value, auto-detect if needed
+    let thermal_zone = {
+        let config_type_path = format!("/sys/class/thermal/{}/type", config.thermal_zone);
+        let config_zone_type = fs::read_to_string(&config_type_path)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+
+        if CPU_TEMP_TYPES.contains(&config_zone_type.as_str()) {
+            config.thermal_zone.clone()
+        } else if let Some(detected) = detect_cpu_thermal_zone() {
+            warn!(
+                "Configured thermal_zone '{}' (type='{}') is not a known CPU sensor. Auto-detected '{}' (recommend updating config)",
+                config.thermal_zone, config_zone_type, detected
+            );
+            detected
+        } else {
+            warn!(
+                "Configured thermal_zone '{}' (type='{}') is not a known CPU sensor and no known CPU sensor found. Using as-is.",
+                config.thermal_zone, config_zone_type
+            );
+            config.thermal_zone.clone()
+        }
+    };
+    info!("Using configuration: thermal_zone={} (from config: {}), predict_ahead_sec={}s, temp_full_speed={}°C",
+          thermal_zone, config.thermal_zone, config.predict_ahead_sec, config.temp_full_speed);
 
     // Open log file with buffered writer for better performance
     let log_file = open_log_file(LOG_FILE)?;
@@ -587,7 +635,7 @@ async fn run_daemon(config_path: &str) -> Result<()> {
             .unwrap()
             .as_secs();
 
-        let temp_c = read_cpu_temp(&config.thermal_zone).await?;
+        let temp_c = read_cpu_temp(&thermal_zone).await?;
         let cpu_load = read_cpu_load()?;
 
         // Calculate temperature slope using least-squares regression
@@ -719,6 +767,12 @@ async fn run_daemon(config_path: &str) -> Result<()> {
         error!("Failed to save state on shutdown: {}", e);
     } else {
         info!("State saved successfully");
+    }
+
+    // Restore CPU frequency to maximum before shutdown
+    info!("Restoring CPU frequency to maximum...");
+    if let Err(e) = set_cpu_freq(freq_limits.max_khz) {
+        error!("Failed to restore CPU frequency on shutdown: {}", e);
     }
 
     info!("Shutdown complete");
