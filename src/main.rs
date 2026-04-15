@@ -445,6 +445,15 @@ fn create_freq_limits(config: &Config) -> Result<FreqLimits> {
     Ok(FreqLimits { max_khz, mid_khz, min_khz })
 }
 
+/// Read the current CPU scaling governor from cpu0.
+/// Returns the governor name (e.g. "performance", "powersave", "schedutil").
+fn read_cpu_governor() -> Result<String> {
+    let path = Path::new(CPU_FREQ_DIR).join("cpu0/cpufreq/scaling_governor");
+    fs::read_to_string(&path)
+        .map(|s| s.trim().to_string())
+        .with_context(|| format!("Failed to read CPU governor from {}", path.display()))
+}
+
 fn set_cpu_freq(freq_khz: u64) -> Result<()> {
     let cpu_dirs: Vec<_> = fs::read_dir(CPU_FREQ_DIR)?
         .filter_map(|entry| entry.ok())
@@ -682,6 +691,27 @@ async fn run_daemon(config_path: &str) -> Result<()> {
             }
 
             save_state(&state).await?;
+        }
+
+        // Only throttle when CPU governor is "performance"
+        let current_governor = match read_cpu_governor() {
+            Ok(g) => g,
+            Err(e) => {
+                warn!("Cannot read CPU governor: {}, skipping frequency control", e);
+                continue;
+            }
+        };
+        if current_governor != "performance" {
+            // Restore max frequency if we were previously throttling
+            if last_applied_khz != freq_limits.max_khz {
+                info!("Governor changed to '{}', restoring max frequency", current_governor);
+                if let Err(e) = set_cpu_freq(freq_limits.max_khz) {
+                    error!("Failed to restore CPU frequency: {}", e);
+                } else {
+                    last_applied_khz = freq_limits.max_khz;
+                }
+            }
+            continue;
         }
 
         // Frequency control with descent rate limiting
